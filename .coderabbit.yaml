@@ -213,9 +213,9 @@ issue_enrichment:
   auto_enrich:
     enabled: false
   planning:
-    enabled: true
+    enabled: false
     auto_planning:
-      enabled: true
+      enabled: false
       labels: []
   labeling:
     labeling_instructions: []
