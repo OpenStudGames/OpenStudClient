@@ -7,7 +7,9 @@
 CMakeCache.txt
 CMakeFiles/
 CMakeScripts/
-cmake_install.cmake
+cmake_install
+compile_commands.json
+CPack*Config.cmake
 install_manifest.txt
 Makefile
 # Ninja specific
@@ -58,3 +60,6 @@ Session.vim
 # If you use vcpkg or conan
 vcpkg_installed/
 conan/
+_deps
+
+include
