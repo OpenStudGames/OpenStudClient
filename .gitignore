@@ -1,1 +1,60 @@
-/target
+# who cares about gitignore so im gonna vibe code it
+# --- CMake / Build Artifacts ---
+/build/
+/bin/
+/lib/
+/out/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+Makefile
+# Ninja specific
+.ninja_deps
+.ninja_log
+build.ninja
+
+# --- IDE / Editor Specific ---
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# CLion / JetBrains
+.idea/
+cmake-build-*/
+
+# Vim / Neovim
+*.swp
+*.swo
+Session.vim
+.netrwhist
+
+# --- Compilers & Languages ---
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.pdb
+
+# --- Arch / Linux Specific ---
+*~
+.DS_Store
+.directory
+.trash/
+# bro ds store isnt for linux its for mac what are these clankers going on about
+
+# --- Dependency Managers ---
+# If you use vcpkg or conan
+vcpkg_installed/
+conan/

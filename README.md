@@ -1,0 +1,1 @@
+Build with `cmake -G Ninja -B build`
