@@ -1,0 +1,12 @@
+"type/docs":
+- changed-files:
+  - any-glob-to-any-file: ['docs/**', '*.md']
+"area/studio":
+- changed-files:
+  - any-glob-to-any-file: ['src/studio/**']
+"area/client":
+- changed-files:
+  - any-glob-to-any-file: ['src/client/**']
+"area/core":
+- changed-files:
+  - any-glob-to-any-file: ['src/core/**']
