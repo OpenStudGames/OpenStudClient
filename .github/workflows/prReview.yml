@@ -1,0 +1,318 @@
+name: "Pull Request Reviewer"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  repository-projects: read
+  models: read
+
+jobs:
+  pr-analyze:
+    # Respond on PR events, or when someone mentions the bot in a comment on a PR.
+    if: >-
+      ${{
+        github.event_name == 'pull_request' ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@OmniBlocks/ai')) ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && contains(github.event.comment.body, '@OmniBlocks/ai'))
+      }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Add eyes reaction (comment events only)
+        if: ${{ github.event.comment != null }}
+        run: |
+          set -euo pipefail
+
+          # Determine which REST endpoint to call based on comment type.
+          # - issue_comment: /issues/comments/{comment_id}/reactions
+          # - pull_request_review_comment: /pulls/comments/{comment_id}/reactions
+          if [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            ENDPOINT="/repos/${{ github.repository }}/pulls/comments/${{ github.event.comment.id }}/reactions"
+          else
+            ENDPOINT="/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions"
+          fi
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$ENDPOINT" \
+            -f content='eyes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------
+      # 1️⃣ Checkout the whole repository (history + tags)
+      # ------------------------------------------------------
+      - name: Checkout repository (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------
+      # 2️⃣ Find the most recent git tag (or "none")
+      # ------------------------------------------------------
+      - name: Get latest release tag (if any)
+        id: tag
+        run: |
+          set -e
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            LATEST_TAG=$(git describe --tags --abbrev=0)
+          else
+            LATEST_TAG="none"
+          fi
+          echo "LATEST_TAG=${LATEST_TAG}" >> "$GITHUB_ENV"
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------
+      # 3️⃣ Build a live "project status" snapshot (optional; safe if it fails)
+      # NOTE: GH Projects v2 access may require additional permissions/config.
+      # ------------------------------------------------------
+      - name: Generate real‑time project status report
+        id: project-status
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORG: OpenStudGames
+          REPO: OpenStudClient
+          PROJECT_NUMBER: 1
+        run: |
+          set -euo pipefail
+          STATUS_FILE="project_status_report.txt"
+          echo "# Real‑Time Project Status Snapshot" > "$STATUS_FILE"
+          echo "Generated on $(date)" >> "$STATUS_FILE"
+          echo "-----------------------------------" >> "$STATUS_FILE"
+          echo "" >> "$STATUS_FILE"
+
+          echo "## Recent Merged Pull Requests (last 10)" >> "$STATUS_FILE"
+          gh pr list \
+            --repo "$ORG/$REPO" \
+            --state merged \
+            --limit 10 \
+            --json number,title,author,url \
+            --jq '.[] | "- PR #\(.number): \(.title) (by \(.author.login)) \(.url)"' \
+            >> "$STATUS_FILE" 2>/dev/null || echo "⚠️ Could not fetch PRs" >> "$STATUS_FILE"
+          echo "" >> "$STATUS_FILE"
+
+          echo "## Recent Open Issues (last 10)" >> "$STATUS_FILE"
+          gh issue list \
+            --repo "$ORG/$REPO" \
+            --state open \
+            --limit 10 \
+            --json number,title,author,url \
+            --jq '.[] | "- Issue #\(.number): \(.title) (by \(.author.login)) \(.url)"' \
+            >> "$STATUS_FILE" 2>/dev/null || echo "⚠️ Could not fetch issues" >> "$STATUS_FILE"
+          echo "" >> "$STATUS_FILE"
+
+          # Best-effort Projects v2 (may fail depending on auth)
+          echo "## Current GitHub Project Board (Project #$PROJECT_NUMBER)" >> "$STATUS_FILE"
+          echo "(If this is empty, Projects access may not be configured.)" >> "$STATUS_FILE"
+          echo "" >> "$STATUS_FILE"
+
+          {
+            echo "status_report<<EOF"
+            cat "$STATUS_FILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------
+      # 4️⃣ Resolve PR number (PR event vs comment-on-PR event)
+      # ------------------------------------------------------
+      - name: Resolve PR number
+        id: pr
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # For pull_request_review_comment OR issue_comment-on-PR, the PR number is the issue number
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------
+      # 5️⃣ Get full PR context (body + comments + changed files + diff)
+      # ------------------------------------------------------
+      - name: Get PR context
+        id: get-context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+
+          # Basic PR info + conversation (includes PR body + comments)
+          PR_VIEW=$(gh pr view "$PR_NUMBER" --comments || true)
+
+          # Changed files list
+          PR_FILES=$(gh pr view "$PR_NUMBER" --json files --jq '.files[].path' 2>/dev/null || true)
+
+          # Patch diff (may be large; AI step below should handle summarizing)
+          PR_DIFF=$(gh pr diff "$PR_NUMBER" 2>/dev/null || true)
+
+          {
+            echo "pr_view<<EOF"
+            echo "$PR_VIEW"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "changed_files<<EOF"
+            echo "$PR_FILES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "diff<<EOF"
+            # Cap to ~200k chars to avoid blowing output limits
+            echo "$PR_DIFF" | head -c 200000
+            echo
+            echo "[DIFF TRUNCATED IF TOO LARGE]"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------
+      # 6️⃣ First‑pass – decide which repo files are relevant (optional)
+      # ------------------------------------------------------
+      - name: Generate repository index (best-effort)
+        id: repo-index
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          INDEX_FILE="repo_index.txt"
+          echo "# Repository Structure Summary" > "$INDEX_FILE"
+          echo "## Top-level (depth ≤ 3)" >> "$INDEX_FILE"
+          find . -maxdepth 3 -type d \
+            -not -path "./.git*" \
+            -not -path "./node_modules*" \
+            | sort >> "$INDEX_FILE" || true
+          echo "" >> "$INDEX_FILE"
+
+          echo "## Notable source files (first 200)" >> "$INDEX_FILE"
+          find . -type f \
+            -not -path "./.git/*" \
+            -not -path "./node_modules/*" \
+            | head -n 200 >> "$INDEX_FILE" || true
+
+          {
+            echo "repo_index<<EOF"
+            cat "$INDEX_FILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: First‑pass decide which files are relevant
+        id: decide
+        uses: actions/ai-inference@v1
+        with:
+          model: 'mistral-ai/Ministral-3B'
+          prompt: |
+            You are an assistant that decides what code context is needed to understand a GitHub pull request.
+            Use the repository index below to guide your selection.
+
+            ${{ steps.repo-index.outputs.repo_index }}
+
+            Output only a newline‑separated list of at most 6 relative file paths that are most relevant to this PR.
+            If no additional files are needed beyond the diff, output exactly: NONE
+
+            Repository: ${{ github.repository }}
+            Current version tag: ${{ env.LATEST_TAG }}
+
+            PR Context:
+            ${{ steps.get-context.outputs.pr_view }}
+
+            Changed files:
+            ${{ steps.get-context.outputs.changed_files }}
+
+      - name: Extract snippets for files suggested by AI (capped)
+        id: snip
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          RESP="${{ steps.decide.outputs.response }}"
+          FILES=$(printf "%s\n" "$RESP" | sed '/^\s*$/d')
+          OUTFILE=ai_snippets.txt
+          > "$OUTFILE"
+
+          if [ "$FILES" = "NONE" ] || [ -z "$FILES" ]; then
+            echo "NO_SNIPPETS" > "$OUTFILE"
+          else
+            COUNT=0
+            REPO_ROOT="$GITHUB_WORKSPACE"
+            printf "%s\n" "$FILES" |
+            while IFS= read -r f && [ $COUNT -lt 6 ]; do
+              COUNT=$((COUNT + 1))
+              f_clean=$(echo "$f" | xargs)
+
+              if [[ "$f_clean" == *"../"* ]] || [[ "$f_clean" == /* ]]; then
+                echo "[SECURITY BLOCKED: Invalid path '$f_clean']" >> "$OUTFILE"
+                continue
+              fi
+
+              ABS_PATH="$REPO_ROOT/$f_clean"
+              echo "----- FILE: $f_clean -----" >> "$OUTFILE"
+              if [ -f "$ABS_PATH" ]; then
+                head -c 20000 "$ABS_PATH" >> "$OUTFILE" || true
+                echo "" >> "$OUTFILE"
+              else
+                echo "[MISSING FILE: $f_clean]" >> "$OUTFILE"
+              fi
+            done
+          fi
+
+          {
+            echo "snippets<<EOF"
+            cat "$OUTFILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------
+      # 7️⃣ Final AI analysis
+      # ------------------------------------------------------
+      - name: AI PR analysis
+        id: final
+        uses: actions/ai-inference@v1
+        with:
+          model: 'mistral-ai/Ministral-3B'
+          prompt: |
+            You are a PR reviewer for OpenStud, an open source Roblox-like game.
+            Your job is to analyze and review PR's made by contributors.
+            This is the PR View:
+            PR VIEW (title/body/comments):
+            ${{ steps.get-context.outputs.pr_view }}
+            This is the Changed Files
+            CHANGED FILES:
+            ${{ steps.get-context.outputs.changed_files }}
+            Diffs:
+            DIFF (may be truncated):
+            ${{ steps.get-context.outputs.diff }}
+            And extra snippets:
+            EXTRA SNIPPETS (best-effort):
+            ${{ steps.snip.outputs.snippets }}
+
+            These things are essential to reviewing someones PR.
+            People who should have minimal review are the following developers:
+            supervoidcoder
+            Graison-P
+            ampeletrecuted
+
+            Your job is pretty simple! If you find a spam PR, close it and reply apropreitly. This is the same for unconstructive/useless PR's.
+      # ------------------------------------------------------
+      # 8️⃣ Post result as a PR comment
+      # ------------------------------------------------------
+      - name: Comment with AI analysis
+        if: ${{ steps.final.outputs.response != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          echo "${{ steps.final.outputs.response }}" > response.txt
+          gh pr comment "$PR_NUMBER" --body-file response.txt
